@@ -334,22 +334,22 @@ public class VehicleDataConfig extends MTVConfig {
                     "SELECT license_plate, item_index, item_data FROM vehicle_trunk")) {
 
                 ResultSet rs = stmt.executeQuery();
-                Map<String, List<ItemStack>> trunkItemsMap = new HashMap<>();
+                Map<String, List<String>> trunkStringsMap = new HashMap<>();
 
                 while (rs.next()) {
                     String licensePlate = rs.getString("license_plate");
                     int index = rs.getInt("item_index");
                     String itemData = rs.getString("item_data");
 
-                    List<ItemStack> items = trunkItemsMap.computeIfAbsent(licensePlate, k -> new ArrayList<>());
+                    List<String> items = trunkStringsMap.computeIfAbsent(licensePlate, k -> new ArrayList<>());
                     while (items.size() <= index) {
                         items.add(null);
                     }
-                    items.set(index, ItemUtils.deserializeItemStack(itemData));
+                    items.set(index, itemData); // Store the serialized string directly
                 }
 
-                // Store loaded items in vehicle data
-                for (Map.Entry<String, List<ItemStack>> entry : trunkItemsMap.entrySet()) {
+                // Store loaded strings in vehicle data
+                for (Map.Entry<String, List<String>> entry : trunkStringsMap.entrySet()) {
                     Map<Option, Object> vehicleData = vehicleDataInMemory.get(entry.getKey());
                     if (vehicleData != null) {
                         vehicleData.put(Option.TRUNK_DATA, entry.getValue());
@@ -687,16 +687,16 @@ public class VehicleDataConfig extends MTVConfig {
             }
 
             // Insert trunk items
-            List<ItemStack> trunkItems = (List<ItemStack>) vehicleData.get(Option.TRUNK_DATA);
-            if (trunkItems != null && !trunkItems.isEmpty()) {
+            List<String> trunkData = (List<String>) vehicleData.get(Option.TRUNK_DATA);
+            if (trunkData != null && !trunkData.isEmpty()) {
                 String trunkSql = "INSERT INTO vehicle_trunk (license_plate, item_index, item_data) VALUES (?, ?, ?)";
                 try (PreparedStatement stmt = conn.prepareStatement(trunkSql)) {
-                    for (int i = 0; i < trunkItems.size(); i++) {
-                        ItemStack item = trunkItems.get(i);
-                        if (item != null) {
+                    for (int i = 0; i < trunkData.size(); i++) {
+                        String itemData = trunkData.get(i);
+                        if (itemData != null) {
                             stmt.setString(1, licensePlate);
                             stmt.setInt(2, i);
-                            stmt.setString(3, ItemUtils.serializeItemStack(item));
+                            stmt.setString(3, itemData);
                             stmt.addBatch();
                         }
                     }
@@ -1073,13 +1073,19 @@ public class VehicleDataConfig extends MTVConfig {
                             Main.logSevere("Invalid type for " + dataOption + ": Expected List, got " + value.getClass().getName());
                             return;
                         }
-                        // Validate all items are ItemStacks
+                        // Serialize each ItemStack to a string
+                        List<String> serializedItems = new ArrayList<>();
                         for (Object item : (List<?>) value) {
-                            if (item != null && !(item instanceof ItemStack)) {
+                            if (item instanceof ItemStack) {
+                                serializedItems.add(ItemUtils.serializeItemStack((ItemStack) item));
+                            } else if (item == null) {
+                                serializedItems.add(null);
+                            } else {
                                 Main.logSevere("Invalid item in trunk data: " + item.getClass().getName());
                                 return;
                             }
                         }
+                        value = serializedItems;
                         break;
                 }
             } catch (NumberFormatException e) {
