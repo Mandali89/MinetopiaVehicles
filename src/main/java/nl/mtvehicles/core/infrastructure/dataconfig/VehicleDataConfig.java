@@ -266,6 +266,9 @@ public class VehicleDataConfig extends MTVConfig {
         // User databases are loaded during initialization
     }
 
+    /**
+     * Load all vehicle data from a specific database connection into memory
+     */
     private void loadFromDatabase(Connection conn) {
         try {
             // Load vehicles
@@ -275,7 +278,6 @@ public class VehicleDataConfig extends MTVConfig {
                     String licensePlate = rs.getString("license_plate");
                     Map<Option, Object> vehicleData = new HashMap<>();
 
-                    // Map all vehicle options
                     vehicleData.put(Option.NAME, rs.getString("name"));
                     vehicleData.put(Option.VEHICLE_TYPE, rs.getString("vehicle_type"));
                     vehicleData.put(Option.SKIN_ITEM, rs.getString("skin_item"));
@@ -299,65 +301,56 @@ public class VehicleDataConfig extends MTVConfig {
                     vehicleData.put(Option.NBT_VALUE, rs.getString("nbt_value"));
                     vehicleData.put(Option.IS_PUBLIC, rs.getBoolean("is_public"));
 
-                    // Initialize empty lists for members and riders
-                    vehicleData.put(Option.MEMBERS, new ArrayList<String>());
-                    vehicleData.put(Option.RIDERS, new ArrayList<String>());
+                    // Initialize members and riders
+                    List<String> members = new ArrayList<>();
+                    List<String> riders = new ArrayList<>();
+                    try (PreparedStatement memberStmt = conn.prepareStatement(
+                            "SELECT member_uuid, is_rider FROM vehicle_members WHERE license_plate = ?")) {
+                        memberStmt.setString(1, licensePlate);
+                        ResultSet memberRs = memberStmt.executeQuery();
+                        while (memberRs.next()) {
+                            String memberUuid = memberRs.getString("member_uuid");
+                            members.add(memberUuid);
+                            if (memberRs.getBoolean("is_rider")) {
+                                riders.add(memberUuid);
+                            }
+                        }
+                    }
+                    vehicleData.put(Option.MEMBERS, members);
+                    vehicleData.put(Option.RIDERS, riders);
                     vehicleData.put(Option.TRUNK_DATA, new ArrayList<String>());
 
                     vehicleDataInMemory.put(licensePlate, vehicleData);
-                }
-            }
-
-            // Load members and riders
-            try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM vehicle_members")) {
-                ResultSet rs = stmt.executeQuery();
-                while (rs.next()) {
-                    String licensePlate = rs.getString("license_plate");
-                    String memberUuid = rs.getString("member_uuid");
-                    boolean isRider = rs.getBoolean("is_rider");
-
-                    Map<Option, Object> vehicleData = vehicleDataInMemory.get(licensePlate);
-                    if (vehicleData != null) {
-                        List<String> members = (List<String>) vehicleData.computeIfAbsent(Option.MEMBERS, k -> new ArrayList<>());
-                        List<String> riders = (List<String>) vehicleData.computeIfAbsent(Option.RIDERS, k -> new ArrayList<>());
-
-                        members.add(memberUuid);
-                        if (isRider) {
-                            riders.add(memberUuid);
-                        }
-                    }
+                    Main.logInfo("Loaded vehicle: " + licensePlate + ", Owner: " + vehicleData.get(Option.OWNER) + ", Riders: " + riders);
                 }
             }
 
             // Load trunk data
             try (PreparedStatement stmt = conn.prepareStatement(
-                    "SELECT license_plate, item_index, item_data FROM vehicle_trunk")) {
-
+                    "SELECT license_plate, item_index, item_data FROM vehicle_trunk ORDER BY item_index")) {
                 ResultSet rs = stmt.executeQuery();
                 Map<String, List<String>> trunkStringsMap = new HashMap<>();
-
                 while (rs.next()) {
                     String licensePlate = rs.getString("license_plate");
                     int index = rs.getInt("item_index");
                     String itemData = rs.getString("item_data");
-
                     List<String> items = trunkStringsMap.computeIfAbsent(licensePlate, k -> new ArrayList<>());
                     while (items.size() <= index) {
                         items.add(null);
                     }
-                    items.set(index, itemData); // Store the serialized string directly
+                    items.set(index, itemData);
                 }
-
-                // Store loaded strings in vehicle data
                 for (Map.Entry<String, List<String>> entry : trunkStringsMap.entrySet()) {
                     Map<Option, Object> vehicleData = vehicleDataInMemory.get(entry.getKey());
                     if (vehicleData != null) {
                         vehicleData.put(Option.TRUNK_DATA, entry.getValue());
+                        Main.logInfo("Loaded trunk data for vehicle: " + entry.getKey() + ", Items: " + entry.getValue().size());
                     }
                 }
             }
         } catch (SQLException e) {
             Main.logSevere("Failed to load vehicle data from database: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -529,6 +522,13 @@ public class VehicleDataConfig extends MTVConfig {
         }
     }
 
+    /**
+     * Save a vehicle's data to its owner's database
+     *
+     * @param licensePlate Vehicle's license plate
+     * @param conn         Database connection for the owner's database
+     * @throws SQLException If a database error occurs
+     */
     public void saveVehicleToDatabase(String licensePlate, Connection conn) throws SQLException {
         if (conn == null || conn.isClosed()) {
             Main.logSevere("Cannot save vehicle " + licensePlate + " - database connection is invalid");
@@ -536,25 +536,27 @@ public class VehicleDataConfig extends MTVConfig {
         }
 
         Map<Option, Object> vehicleData = vehicleDataInMemory.get(licensePlate);
-        if (vehicleData == null) return;
+        if (vehicleData == null) {
+            Main.logWarning("No in-memory data for vehicle " + licensePlate + " - skipping save");
+            return;
+        }
 
         boolean autoCommit = conn.getAutoCommit();
         conn.setAutoCommit(false);
 
         try {
-            // Delete existing data
+            // Delete existing data to prevent duplicates
             executeUpdate(conn, "DELETE FROM vehicle_trunk WHERE license_plate = ?", licensePlate);
             executeUpdate(conn, "DELETE FROM vehicle_members WHERE license_plate = ?", licensePlate);
             executeUpdate(conn, "DELETE FROM vehicles WHERE license_plate = ?", licensePlate);
 
-            // Insert vehicle
+            // Insert vehicle data
             String vehicleSql = "INSERT INTO vehicles (" +
                     "license_plate, owner_uuid, vehicle_type, name, skin_item, skin_damage, " +
                     "fuel_enabled, fuel, fuel_usage, braking_speed, friction_speed, acceleration_speed, " +
                     "max_speed, max_speed_backwards, rotation_speed, trunk_enabled, trunk_rows, " +
                     "is_open, is_glowing, horn_enabled, health, nbt_value, is_public" +
                     ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-
             try (PreparedStatement stmt = conn.prepareStatement(vehicleSql)) {
                 int index = 1;
                 stmt.setString(index++, licensePlate);
@@ -563,114 +565,57 @@ public class VehicleDataConfig extends MTVConfig {
                 stmt.setString(index++, (String) vehicleData.get(Option.NAME));
                 stmt.setString(index++, (String) vehicleData.get(Option.SKIN_ITEM));
 
-                // Handle numeric types with null checks
                 Object skinDamage = vehicleData.get(Option.SKIN_DAMAGE);
-                if (skinDamage instanceof Number) {
-                    stmt.setInt(index++, ((Number)skinDamage).intValue());
-                } else {
-                    stmt.setNull(index++, Types.INTEGER);
-                }
+                stmt.setInt(index++, skinDamage instanceof Number ? ((Number) skinDamage).intValue() : 0);
 
-                // Handle boolean options with null checks
-                Boolean fuelEnabled = (Boolean) vehicleData.get(Option.FUEL_ENABLED);
-                stmt.setBoolean(index++, fuelEnabled != null ? fuelEnabled : false);
+                stmt.setBoolean(index++, (Boolean) vehicleData.getOrDefault(Option.FUEL_ENABLED, false));
 
                 Object fuel = vehicleData.get(Option.FUEL);
-                if (fuel instanceof Number) {
-                    stmt.setDouble(index++, ((Number)fuel).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, fuel instanceof Number ? ((Number) fuel).doubleValue() : 0.0);
 
                 Object fuelUsage = vehicleData.get(Option.FUEL_USAGE);
-                if (fuelUsage instanceof Number) {
-                    stmt.setDouble(index++, ((Number)fuelUsage).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, fuelUsage instanceof Number ? ((Number) fuelUsage).doubleValue() : 0.0);
 
                 Object brakingSpeed = vehicleData.get(Option.BRAKING_SPEED);
-                if (brakingSpeed instanceof Number) {
-                    stmt.setDouble(index++, ((Number)brakingSpeed).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, brakingSpeed instanceof Number ? ((Number) brakingSpeed).doubleValue() : 0.0);
 
                 Object frictionSpeed = vehicleData.get(Option.FRICTION_SPEED);
-                if (frictionSpeed instanceof Number) {
-                    stmt.setDouble(index++, ((Number)frictionSpeed).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, frictionSpeed instanceof Number ? ((Number) frictionSpeed).doubleValue() : 0.0);
 
                 Object accelerationSpeed = vehicleData.get(Option.ACCELERATION_SPEED);
-                if (accelerationSpeed instanceof Number) {
-                    stmt.setDouble(index++, ((Number)accelerationSpeed).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, accelerationSpeed instanceof Number ? ((Number) accelerationSpeed).doubleValue() : 0.0);
 
                 Object maxSpeed = vehicleData.get(Option.MAX_SPEED);
-                if (maxSpeed instanceof Number) {
-                    stmt.setDouble(index++, ((Number)maxSpeed).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, maxSpeed instanceof Number ? ((Number) maxSpeed).doubleValue() : 0.0);
 
                 Object maxSpeedBackwards = vehicleData.get(Option.MAX_SPEED_BACKWARDS);
-                if (maxSpeedBackwards instanceof Number) {
-                    stmt.setDouble(index++, ((Number)maxSpeedBackwards).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, maxSpeedBackwards instanceof Number ? ((Number) maxSpeedBackwards).doubleValue() : 0.0);
 
                 Object rotationSpeed = vehicleData.get(Option.ROTATION_SPEED);
-                if (rotationSpeed instanceof Number) {
-                    stmt.setDouble(index++, ((Number)rotationSpeed).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, rotationSpeed instanceof Number ? ((Number) rotationSpeed).doubleValue() : 0.0);
 
-                Boolean trunkEnabled = (Boolean) vehicleData.get(Option.TRUNK_ENABLED);
-                stmt.setBoolean(index++, trunkEnabled != null ? trunkEnabled : false);
+                stmt.setBoolean(index++, (Boolean) vehicleData.getOrDefault(Option.TRUNK_ENABLED, false));
 
                 Object trunkRows = vehicleData.get(Option.TRUNK_ROWS);
-                if (trunkRows instanceof Number) {
-                    stmt.setInt(index++, ((Number)trunkRows).intValue());
-                } else {
-                    stmt.setNull(index++, Types.INTEGER);
-                }
+                stmt.setInt(index++, trunkRows instanceof Number ? ((Number) trunkRows).intValue() : 1);
 
-                Boolean isOpen = (Boolean) vehicleData.get(Option.IS_OPEN);
-                stmt.setBoolean(index++, isOpen != null ? isOpen : false);
-
-                Boolean isGlowing = (Boolean) vehicleData.get(Option.IS_GLOWING);
-                stmt.setBoolean(index++, isGlowing != null ? isGlowing : false);
-
-                Boolean hornEnabled = (Boolean) vehicleData.get(Option.HORN_ENABLED);
-                stmt.setBoolean(index++, hornEnabled != null ? hornEnabled : false);
+                stmt.setBoolean(index++, (Boolean) vehicleData.getOrDefault(Option.IS_OPEN, false));
+                stmt.setBoolean(index++, (Boolean) vehicleData.getOrDefault(Option.IS_GLOWING, false));
+                stmt.setBoolean(index++, (Boolean) vehicleData.getOrDefault(Option.HORN_ENABLED, false));
 
                 Object health = vehicleData.get(Option.HEALTH);
-                if (health instanceof Number) {
-                    stmt.setDouble(index++, ((Number)health).doubleValue());
-                } else {
-                    stmt.setNull(index++, Types.DOUBLE);
-                }
+                stmt.setDouble(index++, health instanceof Number ? ((Number) health).doubleValue() : 0.0);
 
                 String nbtValue = (String) vehicleData.get(Option.NBT_VALUE);
-                if (nbtValue != null) {
-                    stmt.setString(index++, nbtValue);
-                } else {
-                    stmt.setNull(index++, Types.VARCHAR);
-                }
+                stmt.setString(index++, nbtValue != null ? nbtValue : null);
 
-                Boolean isPublic = (Boolean) vehicleData.get(Option.IS_PUBLIC);
-                stmt.setBoolean(index++, isPublic != null ? isPublic : false);
+                stmt.setBoolean(index++, (Boolean) vehicleData.getOrDefault(Option.IS_PUBLIC, false));
 
                 stmt.executeUpdate();
+                Main.logInfo("Saved vehicle data for " + licensePlate);
             }
 
-            // Insert members
+            // Save members and riders
             List<String> members = (List<String>) vehicleData.get(Option.MEMBERS);
             List<String> riders = (List<String>) vehicleData.get(Option.RIDERS);
             if (members != null && !members.isEmpty()) {
@@ -683,10 +628,11 @@ public class VehicleDataConfig extends MTVConfig {
                         stmt.addBatch();
                     }
                     stmt.executeBatch();
+                    Main.logInfo("Saved " + members.size() + " members for vehicle " + licensePlate + ", riders: " + riders);
                 }
             }
 
-            // Insert trunk items
+            // Save trunk items
             List<String> trunkData = (List<String>) vehicleData.get(Option.TRUNK_DATA);
             if (trunkData != null && !trunkData.isEmpty()) {
                 String trunkSql = "INSERT INTO vehicle_trunk (license_plate, item_index, item_data) VALUES (?, ?, ?)";
@@ -701,6 +647,7 @@ public class VehicleDataConfig extends MTVConfig {
                         }
                     }
                     stmt.executeBatch();
+                    Main.logInfo("Saved " + trunkData.size() + " trunk items for vehicle " + licensePlate);
                 }
             }
 
@@ -708,10 +655,10 @@ public class VehicleDataConfig extends MTVConfig {
         } catch (SQLException e) {
             try {
                 conn.rollback();
+                Main.logSevere("Rolled back transaction for vehicle " + licensePlate);
             } catch (SQLException ex) {
                 Main.logSevere("Failed to rollback transaction for vehicle " + licensePlate + ": " + ex.getMessage());
             }
-            Main.logSevere("Failed to save vehicle " + licensePlate + ": " + e.getMessage());
             throw e;
         } finally {
             try {
@@ -1002,7 +949,7 @@ public class VehicleDataConfig extends MTVConfig {
      * @param value        New value of the option (should be the same type!)
      */
     public void set(String licensePlate, Option dataOption, Object value) {
-        // Convert numbers to correct types before storing
+        // Validate and convert value types
         if (value != null) {
             try {
                 switch (dataOption) {
@@ -1053,7 +1000,6 @@ public class VehicleDataConfig extends MTVConfig {
                             Main.logSevere("Invalid type for " + dataOption + ": Expected List, got " + value.getClass().getName());
                             return;
                         }
-                        // Validate UUID strings
                         for (Object item : (List<?>) value) {
                             if (!(item instanceof String)) {
                                 Main.logSevere("Invalid member UUID: " + item);
@@ -1073,7 +1019,6 @@ public class VehicleDataConfig extends MTVConfig {
                             Main.logSevere("Invalid type for " + dataOption + ": Expected List, got " + value.getClass().getName());
                             return;
                         }
-                        // Serialize each ItemStack to a string
                         List<String> serializedItems = new ArrayList<>();
                         for (Object item : (List<?>) value) {
                             if (item instanceof ItemStack) {
@@ -1096,27 +1041,25 @@ public class VehicleDataConfig extends MTVConfig {
 
         Map<Option, Object> vehicleData = vehicleDataInMemory.computeIfAbsent(licensePlate, k -> new HashMap<>());
         vehicleData.put(dataOption, value);
+        Main.logInfo("Set " + dataOption + " for vehicle " + licensePlate + " to " + value);
 
-        // Queue async save
-        queueSaveOperation(() -> {
-            try {
-                // For basic vehicle data, we'll let the periodic save handle it
-                // For complex data (members, riders, trunk), we need immediate updates
+        if (dataOption == Option.MEMBERS || dataOption == Option.RIDERS) {
+            String ownerUuid = (String) vehicleData.get(Option.OWNER);
+            if (ownerUuid == null) {
+                Main.logSevere("Cannot save members/riders for vehicle " + licensePlate + ": Owner UUID is null");
+                return;
+            }
+            queueSaveOperation(() -> {
+                try {
+                    Connection userConn = getUserConnection(UUID.fromString(ownerUuid));
+                    executeUpdate(userConn, "DELETE FROM vehicle_members WHERE license_plate = ?", licensePlate);
 
-                if (dataOption == Option.MEMBERS || dataOption == Option.RIDERS) {
-                    // Handle members/rider updates immediately
                     List<String> members = (List<String>) vehicleData.get(Option.MEMBERS);
                     List<String> riders = (List<String>) vehicleData.get(Option.RIDERS);
 
-                    try (PreparedStatement deleteStmt = connection.prepareStatement(
-                            "DELETE FROM vehicle_members WHERE license_plate = ?")) {
-                        deleteStmt.setString(1, licensePlate);
-                        deleteStmt.executeUpdate();
-                    }
-
                     if (members != null && !members.isEmpty()) {
-                        try (PreparedStatement insertStmt = connection.prepareStatement(
-                                "INSERT INTO vehicle_members VALUES (?, ?, ?)")) {
+                        try (PreparedStatement insertStmt = userConn.prepareStatement(
+                                "INSERT INTO vehicle_members (license_plate, member_uuid, is_rider) VALUES (?, ?, ?)")) {
                             for (String memberUuid : members) {
                                 insertStmt.setString(1, licensePlate);
                                 insertStmt.setString(2, memberUuid);
@@ -1124,41 +1067,30 @@ public class VehicleDataConfig extends MTVConfig {
                                 insertStmt.addBatch();
                             }
                             insertStmt.executeBatch();
+                            Main.logInfo("Saved " + members.size() + " members for vehicle " + licensePlate + ", riders: " + riders);
                         }
+                    } else {
+                        Main.logInfo("No members to save for vehicle " + licensePlate);
                     }
-                } else if (dataOption == Option.TRUNK_DATA) {
-                    // Handle trunk updates immediately
-                    List<String> trunkData = (List<String>) vehicleData.get(Option.TRUNK_DATA);
-
-                    try (PreparedStatement deleteStmt = connection.prepareStatement(
-                            "DELETE FROM vehicle_trunk WHERE license_plate = ?")) {
-                        deleteStmt.setString(1, licensePlate);
-                        deleteStmt.executeUpdate();
-                    }
-
-                    if (trunkData != null && !trunkData.isEmpty()) {
-                        try (PreparedStatement insertStmt = connection.prepareStatement(
-                                "INSERT INTO vehicle_trunk VALUES (?, ?, ?)")) {
-                            for (int i = 0; i < trunkData.size(); i++) {
-                                String itemData = trunkData.get(i);
-                                if (itemData != null) {
-                                    insertStmt.setString(1, licensePlate);
-                                    insertStmt.setInt(2, i);
-                                    insertStmt.setString(3, itemData);
-                                    insertStmt.addBatch();
-                                }
-                            }
-                            insertStmt.executeBatch();
-                        }
-                    }
+                } catch (SQLException e) {
+                    Main.logSevere("Failed to update members/riders for vehicle " + licensePlate + ": " + e.getMessage());
                 }
-            } catch (SQLException e) {
-                Main.logSevere("Failed to update vehicle data in database: " + e.getMessage());
-                if (Main.instance.isEnabled()) {  // Only log stack trace if plugin is still enabled
-                    e.printStackTrace();
+            });
+        } else {
+            queueSaveOperation(() -> {
+                try {
+                    String ownerUuid = (String) vehicleData.get(Option.OWNER);
+                    if (ownerUuid == null) {
+                        Main.logSevere("Cannot save vehicle " + licensePlate + ": Owner UUID is null");
+                        return;
+                    }
+                    Connection userConn = getUserConnection(UUID.fromString(ownerUuid));
+                    saveVehicleToDatabase(licensePlate, userConn);
+                } catch (SQLException e) {
+                    Main.logSevere("Failed to save vehicle data for " + licensePlate + ": " + e.getMessage());
                 }
-            }
-        });
+            });
+        }
     }
 
     /**
@@ -1369,27 +1301,29 @@ public class VehicleDataConfig extends MTVConfig {
     }
 
     /**
-     * Close database connection when plugin disables
+     * Close database connections and save all data when plugin disables
      */
     public void onDisable() {
-        // Cancel auto-save task if running
+        // Cancel auto-save task
         if (saveTask != null) {
             try {
                 saveTask.cancel();
+                Main.logInfo("Cancelled auto-save task");
             } catch (Exception e) {
                 Main.logWarning("Failed to cancel save task: " + e.getMessage());
             }
         }
 
-        // Skip processing if already shutting down
+        // Skip if plugin is already disabled
         if (!Main.instance.isEnabled()) {
             Main.logInfo("Skipping final save - plugin is already disabling");
             return;
         }
 
-        // Process any remaining save operations safely
+        // Process pending save operations
         try {
             synchronized (saveQueue) {
+                Main.logInfo("Processing save queue with " + saveQueue.size() + " operations");
                 while (!saveQueue.isEmpty()) {
                     Runnable saveOperation = saveQueue.poll();
                     try {
@@ -1405,6 +1339,14 @@ public class VehicleDataConfig extends MTVConfig {
             Main.logWarning("Error processing save queue: " + e.getMessage());
         }
 
+        // Save all vehicles
+        try {
+            saveToDatabase();
+            Main.logInfo("Completed final save of " + vehicleDataInMemory.size() + " vehicles");
+        } catch (Exception e) {
+            Main.logSevere("Failed to save vehicles during shutdown: " + e.getMessage());
+        }
+
         // Close all user database connections
         for (Map.Entry<String, Connection> entry : userConnections.entrySet()) {
             try {
@@ -1414,7 +1356,7 @@ public class VehicleDataConfig extends MTVConfig {
                     Main.logInfo("Closed database connection for user " + entry.getKey());
                 }
             } catch (SQLException e) {
-                Main.logSevere("Failed to close user database connection: " + e.getMessage());
+                Main.logSevere("Failed to close user database connection for " + entry.getKey() + ": " + e.getMessage());
             }
         }
         userConnections.clear();
@@ -1422,8 +1364,67 @@ public class VehicleDataConfig extends MTVConfig {
         // Clear in-memory data
         vehicleDataInMemory.clear();
         saveQueue.clear();
-
         Main.logInfo("Vehicle data system shutdown complete");
+    }
+
+    /**
+     * Create a new vehicle and save it to the database
+     *
+     * @param licensePlate Unique license plate for the vehicle
+     * @param ownerUuid    UUID of the vehicle owner
+     * @param type         Vehicle type
+     * @param name         Name of the vehicle
+     * @param skinItem     Material of the vehicle skin
+     * @param skinDamage   Durability of the vehicle skin
+     */
+    public void createVehicle(String licensePlate, String ownerUuid, VehicleType type, String name, String skinItem, int skinDamage) {
+        Map<Option, Object> vehicleData = new HashMap<>();
+
+        // Set basic vehicle properties
+        vehicleData.put(Option.OWNER, ownerUuid);
+        vehicleData.put(Option.VEHICLE_TYPE, type.name());
+        vehicleData.put(Option.NAME, name);
+        vehicleData.put(Option.SKIN_ITEM, skinItem);
+        vehicleData.put(Option.SKIN_DAMAGE, skinDamage);
+
+        // Set default values
+        vehicleData.put(Option.FUEL_ENABLED, false);
+        vehicleData.put(Option.FUEL, 0.0);
+        vehicleData.put(Option.FUEL_USAGE, 0.0);
+        vehicleData.put(Option.BRAKING_SPEED, 0.0);
+        vehicleData.put(Option.FRICTION_SPEED, 0.0);
+        vehicleData.put(Option.ACCELERATION_SPEED, 0.0);
+        vehicleData.put(Option.MAX_SPEED, 0.0);
+        vehicleData.put(Option.MAX_SPEED_BACKWARDS, 0.0);
+        vehicleData.put(Option.ROTATION_SPEED, 0.0);
+        vehicleData.put(Option.TRUNK_ENABLED, false);
+        vehicleData.put(Option.TRUNK_ROWS, 1);
+        vehicleData.put(Option.IS_OPEN, false);
+        vehicleData.put(Option.IS_GLOWING, false);
+        vehicleData.put(Option.HORN_ENABLED, VehicleUtils.getHornByDamage(skinDamage));
+        vehicleData.put(Option.HEALTH, VehicleUtils.getMaxHealthByDamage(skinDamage));
+        vehicleData.put(Option.NBT_VALUE, null);
+        vehicleData.put(Option.IS_PUBLIC, false);
+
+        // Initialize members and riders with owner as default rider
+        List<String> riders = new ArrayList<>();
+        riders.add(ownerUuid);
+        vehicleData.put(Option.RIDERS, riders);
+        vehicleData.put(Option.MEMBERS, new ArrayList<>(riders));
+        vehicleData.put(Option.TRUNK_DATA, new ArrayList<String>());
+
+        // Store in memory
+        vehicleDataInMemory.put(licensePlate, vehicleData);
+        Main.logInfo("Created vehicle " + licensePlate + " for owner " + ownerUuid + ", type: " + type);
+
+        // Save immediately to database
+        try {
+            Connection userConn = getUserConnection(UUID.fromString(ownerUuid));
+            saveVehicleToDatabase(licensePlate, userConn);
+            Main.logInfo("Initial save completed for vehicle " + licensePlate);
+        } catch (SQLException e) {
+            Main.logSevere("Failed to save new vehicle " + licensePlate + ": " + e.getMessage());
+        }
     }
 
     /**
