@@ -301,7 +301,7 @@ public class VehicleDataConfig extends MTVConfig {
                     vehicleData.put(Option.NBT_VALUE, rs.getString("nbt_value"));
                     vehicleData.put(Option.IS_PUBLIC, rs.getBoolean("is_public"));
 
-                    // Initialize members and riders
+                    // Load members and riders
                     List<String> members = new ArrayList<>();
                     List<String> riders = new ArrayList<>();
                     try (PreparedStatement memberStmt = conn.prepareStatement(
@@ -321,7 +321,6 @@ public class VehicleDataConfig extends MTVConfig {
                     vehicleData.put(Option.TRUNK_DATA, new ArrayList<String>());
 
                     vehicleDataInMemory.put(licensePlate, vehicleData);
-                    Main.logInfo("Loaded vehicle: " + licensePlate + ", Owner: " + vehicleData.get(Option.OWNER) + ", Riders: " + riders);
                 }
             }
 
@@ -344,21 +343,18 @@ public class VehicleDataConfig extends MTVConfig {
                     Map<Option, Object> vehicleData = vehicleDataInMemory.get(entry.getKey());
                     if (vehicleData != null) {
                         vehicleData.put(Option.TRUNK_DATA, entry.getValue());
-                        Main.logInfo("Loaded trunk data for vehicle: " + entry.getKey() + ", Items: " + entry.getValue().size());
                     }
                 }
             }
         } catch (SQLException e) {
             Main.logSevere("Failed to load vehicle data from database: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 
     /**
-     * Start a task to save data to database periodically
+     * Start a task to save data to database every 10 minutes
      */
     private void startAutoSaveTask() {
-        // Cancel existing task if running
         if (saveTask != null && !saveTask.isCancelled()) {
             saveTask.cancel();
         }
@@ -367,33 +363,18 @@ public class VehicleDataConfig extends MTVConfig {
             @Override
             public void run() {
                 if (!isInitialized) {
-                    Main.logWarning("Skipping auto-save - database not initialized");
+                    Main.logSevere("Skipping auto-save - database not initialized");
                     return;
                 }
 
-                long startTime = System.currentTimeMillis();
-                Main.logInfo("Starting vehicle data auto-save...");
-
                 try {
-                    // Process any pending saves first
-                    processSaveQueue();
-
-                    // Then do a full save
                     saveToDatabase();
-
-                    long duration = System.currentTimeMillis() - startTime;
-                    Main.logInfo(String.format("Auto-save completed in %d ms (%d vehicles saved)",
-                            duration, vehicleDataInMemory.size()));
                 } catch (Exception e) {
                     Main.logSevere("Error during auto-save: " + e.getMessage());
-                    e.printStackTrace();
                 }
             }
         };
-
-        // Save every 10 minutes (20 ticks/sec * 60 sec/min * 10 min)
-        saveTask.runTaskTimerAsynchronously(Main.instance, 12000, 12000);
-        Main.logInfo("Auto-save task scheduled to run every 10 minutes");
+        saveTask.runTaskTimer(Main.instance, 20 * 60 * 10, 20 * 60 * 10); // 10 minutes
     }
 
     /**
@@ -505,16 +486,19 @@ public class VehicleDataConfig extends MTVConfig {
     }
 
     /**
-     * Save all vehicle data from memory to database (async)
+     * Save all vehicle data from memory to database
      */
     public void saveToDatabase() {
-        // Save all vehicles to their respective user databases
         for (Map.Entry<String, Map<Option, Object>> entry : vehicleDataInMemory.entrySet()) {
             String licensePlate = entry.getKey();
-            UUID ownerUuid = UUID.fromString((String) entry.getValue().get(Option.OWNER));
+            String ownerUuid = (String) entry.getValue().get(Option.OWNER);
+            if (ownerUuid == null) {
+                Main.logSevere("Cannot save vehicle " + licensePlate + ": Owner UUID is null");
+                continue;
+            }
 
             try {
-                Connection userConn = getUserConnection(ownerUuid);
+                Connection userConn = getUserConnection(UUID.fromString(ownerUuid));
                 saveVehicleToDatabase(licensePlate, userConn);
             } catch (SQLException e) {
                 Main.logSevere("Failed to save vehicle " + licensePlate + ": " + e.getMessage());
@@ -524,11 +508,8 @@ public class VehicleDataConfig extends MTVConfig {
 
     /**
      * Save a vehicle's data to its owner's database
-     *
-     * @param licensePlate Vehicle's license plate
-     * @param conn         Database connection for the owner's database
-     * @throws SQLException If a database error occurs
      */
+
     public void saveVehicleToDatabase(String licensePlate, Connection conn) throws SQLException {
         if (conn == null || conn.isClosed()) {
             Main.logSevere("Cannot save vehicle " + licensePlate + " - database connection is invalid");
@@ -537,7 +518,6 @@ public class VehicleDataConfig extends MTVConfig {
 
         Map<Option, Object> vehicleData = vehicleDataInMemory.get(licensePlate);
         if (vehicleData == null) {
-            Main.logWarning("No in-memory data for vehicle " + licensePlate + " - skipping save");
             return;
         }
 
@@ -612,7 +592,6 @@ public class VehicleDataConfig extends MTVConfig {
                 stmt.setBoolean(index++, (Boolean) vehicleData.getOrDefault(Option.IS_PUBLIC, false));
 
                 stmt.executeUpdate();
-                Main.logInfo("Saved vehicle data for " + licensePlate);
             }
 
             // Save members and riders
@@ -628,7 +607,6 @@ public class VehicleDataConfig extends MTVConfig {
                         stmt.addBatch();
                     }
                     stmt.executeBatch();
-                    Main.logInfo("Saved " + members.size() + " members for vehicle " + licensePlate + ", riders: " + riders);
                 }
             }
 
@@ -647,7 +625,6 @@ public class VehicleDataConfig extends MTVConfig {
                         }
                     }
                     stmt.executeBatch();
-                    Main.logInfo("Saved " + trunkData.size() + " trunk items for vehicle " + licensePlate);
                 }
             }
 
@@ -655,7 +632,6 @@ public class VehicleDataConfig extends MTVConfig {
         } catch (SQLException e) {
             try {
                 conn.rollback();
-                Main.logSevere("Rolled back transaction for vehicle " + licensePlate);
             } catch (SQLException ex) {
                 Main.logSevere("Failed to rollback transaction for vehicle " + licensePlate + ": " + ex.getMessage());
             }
@@ -928,10 +904,6 @@ public class VehicleDataConfig extends MTVConfig {
 
     /**
      * Get a data option of a vehicle from in-memory data
-     *
-     * @param licensePlate Vehicle's license plate
-     * @param dataOption   Data option of a vehicle
-     * @return Value of the option (as Object)
      */
     public Object get(String licensePlate, Option dataOption) {
         Map<Option, Object> vehicleData = vehicleDataInMemory.get(licensePlate);
@@ -942,11 +914,7 @@ public class VehicleDataConfig extends MTVConfig {
     }
 
     /**
-     * Set a data option of a vehicle in memory and queue database update
-     *
-     * @param licensePlate Vehicle's license plate
-     * @param dataOption   Data option of a vehicle
-     * @param value        New value of the option (should be the same type!)
+     * Set a data option of a vehicle in memory
      */
     public void set(String licensePlate, Option dataOption, Object value) {
         // Validate and convert value types
@@ -1041,63 +1009,10 @@ public class VehicleDataConfig extends MTVConfig {
 
         Map<Option, Object> vehicleData = vehicleDataInMemory.computeIfAbsent(licensePlate, k -> new HashMap<>());
         vehicleData.put(dataOption, value);
-        Main.logInfo("Set " + dataOption + " for vehicle " + licensePlate + " to " + value);
-
-        if (dataOption == Option.MEMBERS || dataOption == Option.RIDERS) {
-            String ownerUuid = (String) vehicleData.get(Option.OWNER);
-            if (ownerUuid == null) {
-                Main.logSevere("Cannot save members/riders for vehicle " + licensePlate + ": Owner UUID is null");
-                return;
-            }
-            queueSaveOperation(() -> {
-                try {
-                    Connection userConn = getUserConnection(UUID.fromString(ownerUuid));
-                    executeUpdate(userConn, "DELETE FROM vehicle_members WHERE license_plate = ?", licensePlate);
-
-                    List<String> members = (List<String>) vehicleData.get(Option.MEMBERS);
-                    List<String> riders = (List<String>) vehicleData.get(Option.RIDERS);
-
-                    if (members != null && !members.isEmpty()) {
-                        try (PreparedStatement insertStmt = userConn.prepareStatement(
-                                "INSERT INTO vehicle_members (license_plate, member_uuid, is_rider) VALUES (?, ?, ?)")) {
-                            for (String memberUuid : members) {
-                                insertStmt.setString(1, licensePlate);
-                                insertStmt.setString(2, memberUuid);
-                                insertStmt.setBoolean(3, riders != null && riders.contains(memberUuid));
-                                insertStmt.addBatch();
-                            }
-                            insertStmt.executeBatch();
-                            Main.logInfo("Saved " + members.size() + " members for vehicle " + licensePlate + ", riders: " + riders);
-                        }
-                    } else {
-                        Main.logInfo("No members to save for vehicle " + licensePlate);
-                    }
-                } catch (SQLException e) {
-                    Main.logSevere("Failed to update members/riders for vehicle " + licensePlate + ": " + e.getMessage());
-                }
-            });
-        } else {
-            queueSaveOperation(() -> {
-                try {
-                    String ownerUuid = (String) vehicleData.get(Option.OWNER);
-                    if (ownerUuid == null) {
-                        Main.logSevere("Cannot save vehicle " + licensePlate + ": Owner UUID is null");
-                        return;
-                    }
-                    Connection userConn = getUserConnection(UUID.fromString(ownerUuid));
-                    saveVehicleToDatabase(licensePlate, userConn);
-                } catch (SQLException e) {
-                    Main.logSevere("Failed to save vehicle data for " + licensePlate + ": " + e.getMessage());
-                }
-            });
-        }
     }
 
     /**
      * Delete a vehicle from in-memory data and database
-     *
-     * @param licensePlate Vehicle's license plate
-     * @throws IllegalStateException If vehicle is already deleted.
      */
     public void delete(String licensePlate) throws IllegalStateException {
         if (!vehicleDataInMemory.containsKey(licensePlate)) {
@@ -1105,17 +1020,6 @@ public class VehicleDataConfig extends MTVConfig {
         }
 
         vehicleDataInMemory.remove(licensePlate);
-
-        // Queue async delete
-        queueSaveOperation(() -> {
-            try (PreparedStatement stmt = connection.prepareStatement(
-                    "DELETE FROM vehicles WHERE license_plate = ?")) {
-                stmt.setString(1, licensePlate);
-                stmt.executeUpdate();
-            } catch (SQLException e) {
-                Main.logSevere("Failed to delete vehicle from database: " + e.getMessage());
-            }
-        });
     }
 
     /**
@@ -1308,41 +1212,14 @@ public class VehicleDataConfig extends MTVConfig {
         if (saveTask != null) {
             try {
                 saveTask.cancel();
-                Main.logInfo("Cancelled auto-save task");
             } catch (Exception e) {
-                Main.logWarning("Failed to cancel save task: " + e.getMessage());
+                Main.logSevere("Failed to cancel save task: " + e.getMessage());
             }
-        }
-
-        // Skip if plugin is already disabled
-        if (!Main.instance.isEnabled()) {
-            Main.logInfo("Skipping final save - plugin is already disabling");
-            return;
-        }
-
-        // Process pending save operations
-        try {
-            synchronized (saveQueue) {
-                Main.logInfo("Processing save queue with " + saveQueue.size() + " operations");
-                while (!saveQueue.isEmpty()) {
-                    Runnable saveOperation = saveQueue.poll();
-                    try {
-                        if (saveOperation != null) {
-                            saveOperation.run();
-                        }
-                    } catch (Exception e) {
-                        Main.logWarning("Error executing save operation: " + e.getMessage());
-                    }
-                }
-            }
-        } catch (Exception e) {
-            Main.logWarning("Error processing save queue: " + e.getMessage());
         }
 
         // Save all vehicles
         try {
             saveToDatabase();
-            Main.logInfo("Completed final save of " + vehicleDataInMemory.size() + " vehicles");
         } catch (Exception e) {
             Main.logSevere("Failed to save vehicles during shutdown: " + e.getMessage());
         }
@@ -1353,7 +1230,6 @@ public class VehicleDataConfig extends MTVConfig {
                 Connection conn = entry.getValue();
                 if (conn != null && !conn.isClosed()) {
                     conn.close();
-                    Main.logInfo("Closed database connection for user " + entry.getKey());
                 }
             } catch (SQLException e) {
                 Main.logSevere("Failed to close user database connection for " + entry.getKey() + ": " + e.getMessage());
@@ -1364,18 +1240,10 @@ public class VehicleDataConfig extends MTVConfig {
         // Clear in-memory data
         vehicleDataInMemory.clear();
         saveQueue.clear();
-        Main.logInfo("Vehicle data system shutdown complete");
     }
 
     /**
-     * Create a new vehicle and save it to the database
-     *
-     * @param licensePlate Unique license plate for the vehicle
-     * @param ownerUuid    UUID of the vehicle owner
-     * @param type         Vehicle type
-     * @param name         Name of the vehicle
-     * @param skinItem     Material of the vehicle skin
-     * @param skinDamage   Durability of the vehicle skin
+     * Create a new vehicle and store it in memory
      */
     public void createVehicle(String licensePlate, String ownerUuid, VehicleType type, String name, String skinItem, int skinDamage) {
         Map<Option, Object> vehicleData = new HashMap<>();
@@ -1415,16 +1283,6 @@ public class VehicleDataConfig extends MTVConfig {
 
         // Store in memory
         vehicleDataInMemory.put(licensePlate, vehicleData);
-        Main.logInfo("Created vehicle " + licensePlate + " for owner " + ownerUuid + ", type: " + type);
-
-        // Save immediately to database
-        try {
-            Connection userConn = getUserConnection(UUID.fromString(ownerUuid));
-            saveVehicleToDatabase(licensePlate, userConn);
-            Main.logInfo("Initial save completed for vehicle " + licensePlate);
-        } catch (SQLException e) {
-            Main.logSevere("Failed to save new vehicle " + licensePlate + ": " + e.getMessage());
-        }
     }
 
     /**
